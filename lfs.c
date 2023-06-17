@@ -30,16 +30,20 @@ typedef struct ctx {
 } ctx_t;
 
 // Writes a `buf` of `len` bytes padded to the nearest number of blocks on disk.
-void write_blocks(const char* buf, size_t len) {
-	ctx_t* ctx = fuse_get_context()->private_data;
+void __write_blocks(int fd, const char* buf, size_t len) {
     for (size_t i = 0; i < (len/BLOCK_SZ); i++) {
-        write(ctx->disk, buf+(i*BLOCK_SZ), BLOCK_SZ);
+        write(fd, buf+(i*BLOCK_SZ), BLOCK_SZ);
     }
 	if (len % BLOCK_SZ != 0) {
 		char end_buf[BLOCK_SZ] = {0};
 		memcpy(end_buf, buf+((len/BLOCK_SZ)*BLOCK_SZ), len % BLOCK_SZ);
-		write(ctx->disk, end_buf, BLOCK_SZ); 
+		write(fd, end_buf, BLOCK_SZ); 
 	}
+}
+
+void write_blocks (const char* buf, size_t len) {
+	ctx_t* ctx = fuse_get_context()->private_data;
+	__write_blocks(ctx->disk, buf, len);
 }
 
 // Reads `num` blocks at the current position in disk to user-specified `buf`
@@ -75,9 +79,7 @@ int get_fd() {
 
 
 static int lfs_readlink(const char *path, char *buf, size_t size) { NOT_IMPLEMENTED("readlink()"); }
-static int lfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) { NOT_IMPLEMENTED("readdir()"); }
 static int lfs_mknod(const char *path, mode_t mode, dev_t rdev) { NOT_IMPLEMENTED("mknod()"); }
-static int lfs_mkdir(const char *path, mode_t mode) { NOT_IMPLEMENTED("mkdir()"); }
 static int lfs_unlink(const char *path) { NOT_IMPLEMENTED("unlink()"); }
 static int lfs_rmdir(const char *path) { NOT_IMPLEMENTED("rmdir()"); }
 static int lfs_symlink(const char *from, const char *to) { NOT_IMPLEMENTED("symlink()"); }
@@ -112,6 +114,11 @@ static ssize_t lfs_copy_file_range(const char *path_in,
 				   struct fuse_file_info *fi_out,
 				   off_t offset_out, size_t len, int flags) { NOT_IMPLEMENTED("copy_file_range()"); }
 #endif
+
+struct superblock {
+	char magic[4];
+	diskptr_t head;
+};
 
 static void* lfs_init(struct fuse_conn_info* conn) {
 	printf("initializing\n");
@@ -173,6 +180,20 @@ static int lfs_write(const char *path, const char *buf, size_t size, off_t offse
 	return size;
 }
 
+#define MAX_FNAME_LEN 28
+struct dir_entry {
+	char name[MAX_FNAME_LEN];
+	size_t inode;
+};
+
+static int lfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+	NOT_IMPLEMENTED("readdir()");
+}
+
+static int lfs_mkdir(const char *path, mode_t mode) {
+	NOT_IMPLEMENTED("mkdir()");
+} 
+
 
 static const struct fuse_operations lfs_oper = {
 	.init           = lfs_init,
@@ -221,16 +242,36 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	ctx_t* ctx = calloc(sizeof(ctx_t), 1);	
+	ctx_t* ctx = calloc(sizeof(ctx_t), 1);
+
+	/* init state         */
+	/* +---+------------+ */
+	/* | # | disk block | */
+	/* +---+------------+ */
+	/* | 0 | superblock | */
+	/* | 1 | inode map  | */
+	/* | 2 | inode map  | */
+	/* | 3 | / data     | */
+	/* | 4 | / inode    | */
+	/* +---+------------+ */	
+	
 	if (strcmp(argv[1], "mkfs") == 0) {
 		ctx->disk = open(argv[2], O_WRONLY | O_CREAT, 0644);
+		struct superblock super = { .magic = "LFS", .head = 5 };		
+		__write_blocks(ctx->disk, (char*)&super, sizeof(struct superblock));
+		
+		ctx->inode_map[0] = 4;
+		__write_blocks(ctx->disk, (char*)ctx->inode_map, sizeof(ctx->inode_map));
+		
+		lseek(ctx->disk, BLOCK_SZ, SEEK_CUR);
+		struct inode root = {.blocks = 1, .block = { 3 }};
+		__write_blocks(ctx->disk, (char*)&root, sizeof(struct inode));
+
 		char buf[BLOCK_SZ] = {0};
-		memcpy(buf, "LFS", 4);
-		write(ctx->disk, buf, BLOCK_SZ);		
-		for (size_t i = 0; i < DEFAULT_DISK_SZ-1; i++) {
-			bzero(buf, 4);
+		for (size_t i = 0; i < DEFAULT_DISK_SZ-5; i++) { // TODO 5 is not general
 		    write(ctx->disk, buf, BLOCK_SZ);
 		}
+		
 		close(ctx->disk);
 		return 0;
 	}
