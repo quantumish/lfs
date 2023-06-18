@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
+#include <assert.h>
 
 typedef unsigned int diskptr_t;
 
@@ -16,6 +18,7 @@ typedef unsigned int diskptr_t;
 #define MAX_FILES 256
 
 #define NOT_IMPLEMENTED(x) printf("got call to %s (not implemented)\n", x)
+#define TODO(x) printf("TODO: %s has yet to be implemented\n", x)
 
 struct superblock {
     char magic[4];
@@ -26,6 +29,7 @@ struct inode {
     size_t size;
     size_t blocks;
     diskptr_t block[16];
+    mode_t mode;
     time_t ctime;
     time_t mtime;
 };
@@ -64,17 +68,25 @@ void read_blocks(char* buf, size_t num) {
 }
 
 // Reads block at `loc` into user-specified `buf`. No side-effects, seeks back.
-void read_block(char* buf, size_t loc) {
+void read_block(char* buf, size_t loc, size_t size) {
     ctx_t* ctx = fuse_get_context()->private_data;
     off_t cur_loc = lseek(ctx->disk, 0, SEEK_CUR);
     lseek(ctx->disk, loc*BLOCK_SZ, SEEK_SET);
-    read(ctx->disk, buf, BLOCK_SZ);
+    read(ctx->disk, buf, size);
     lseek(ctx->disk, cur_loc, SEEK_SET);
 }
 
 diskptr_t current_block() {
     ctx_t* ctx = fuse_get_context()->private_data;
     return lseek(ctx->disk, 0, SEEK_CUR)/BLOCK_SZ;
+}
+
+int get_inumber() {
+    ctx_t* ctx = fuse_get_context()->private_data;
+    for (size_t i = 0; i < MAX_FILES; i++) {
+        if (ctx->inode_map[i] == 0) return i;
+    }
+    return -1;
 }
 
 int get_fd() {
@@ -144,21 +156,96 @@ static int lfs_access(const char *path, int mask) {
     return 0;
 }
 
+int get_parent_inum(const char* path) {
+    if (path[0] != '/') return -1;
+    int parent = 0;
+    char* next;
+    while ((next = strchr(path+1, '/'))) {
+        TODO("actual functionality for get_parent_inum()");
+    }
+    return parent;
+}
+
+const char* get_fname(const char* path) {
+	char* old = NULL;
+	char* next = (char*)path+1;
+    while ((next = strchr(next+1, '/'))) {
+        printf("%s %p\n", next, next);
+		old = next;
+    }    
+    return old+1;
+}
+
 static int lfs_getattr(const char *path, struct stat *stbuf) {
     printf("getattr() on %s\n", path);
     if (strcmp(path, "/") == 0) {
         stbuf->st_mode = 040777;
         return 0;
     }
+    ctx_t* ctx = fuse_get_context()->private_data;
+    int parent = get_parent_inum(path);
+    struct inode dir_inode;
+    read_block((char*)&dir_inode, ctx->inode_map[parent], sizeof(struct inode));
+    if (!(dir_inode.mode & 040000)) return -ENOTDIR;
+        
+    const char* fname = get_fname(path);
+    for (size_t i = 0; i < dir_inode.blocks; i++) {
+        struct dir_entry entries[16] = {0}; // HACK not general
+        read_block((char*)entries, dir_inode.block[i], BLOCK_SZ);
+        for (size_t i = 0; i < 16; i++) {
+            if (strcmp(fname, entries[i].name) == 0) {
+                struct inode inode;
+                read_block((char*)&inode, ctx->inode_map[entries[i].inode], sizeof(struct inode));
+                return inode.mode;
+            }
+        }
+    }
+    
     return -2;
 }
-
-
 static int lfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     printf("create() %s\n", path);
     ctx_t* ctx = fuse_get_context()->private_data;
+
+    // setup inode
+    int inumber = get_inumber();
     fi->fh = get_fd();
     time(&ctx->cur_files[fi->fh].ctime);
+    ctx->cur_files[fi->fh].mode = 010777;
+
+    // write it
+    ctx->inode_map[inumber] = current_block();
+    write_blocks((char*)ctx->cur_files+(fi->fh), sizeof(struct inode));
+
+    // update parent dir
+    int parent = get_parent_inum(path);
+    struct inode dir_inode;
+    read_block((char*)&dir_inode, ctx->inode_map[parent], sizeof(struct inode));
+
+    /* // copy existing blocks */
+    /* for (size_t i = 0; i < dir_inode.blocks-1; i++) { */
+    /*     char block[BLOCK_SZ]; */
+    /*     read_block(block, dir_inode.block[i], BLOCK_SZ); */
+    /*     dir_inode.block[i] = current_block(); */
+    /*     write_blocks(block, BLOCK_SZ);         */
+    /* } */
+    
+    // update last
+    struct dir_entry entries[16] = {0}; // HACK not general
+    read_block((char*)entries, dir_inode.block[dir_inode.blocks-1], BLOCK_SZ);
+    dir_inode.block[dir_inode.blocks-1] = current_block();
+    // FIXME handle full block
+    for (size_t i = 0; i < 16; i++) {
+        if (entries[i].inode == 0) {
+            strcpy(entries[i].name, get_fname(path));
+            entries[i].inode = inumber;            
+        }
+    }
+    time(&dir_inode.mtime);
+
+    // write last + inode
+    write_blocks((char*)entries, BLOCK_SZ);
+    write_blocks((char*)&dir_inode, sizeof(struct inode));    
     return 0;
 }
 
@@ -244,6 +331,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    assert(BLOCK_SZ/sizeof(struct dir_entry) == 16 && "All the directory logic relies on this fact.");
+    
     ctx_t* ctx = calloc(sizeof(ctx_t), 1);
 
     /* init state         */
@@ -266,11 +355,12 @@ int main(int argc, char** argv) {
         __write_blocks(ctx->disk, (char*)ctx->inode_map, sizeof(ctx->inode_map));
                 
         lseek(ctx->disk, BLOCK_SZ, SEEK_CUR);
-        struct inode root = {.blocks = 1, .block = { 3 }};
+        struct inode root = {.blocks = 1, .block = { 3 }, .mode = 040777};
+        time(&root.ctime);
         __write_blocks(ctx->disk, (char*)&root, sizeof(struct inode));
 
         char buf[BLOCK_SZ] = {0};
-        for (size_t i = 0; i < DEFAULT_DISK_SZ-5; i++) { // TODO 5 is not general
+        for (size_t i = 0; i < DEFAULT_DISK_SZ-5; i++) { // HACK 5 is not general
             write(ctx->disk, buf, BLOCK_SZ);
         }
                 
