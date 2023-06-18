@@ -1,4 +1,5 @@
 #define FUSE_USE_VERSION 31
+#include <fuse/fuse.h>
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
 #include <fuse.h>
@@ -14,19 +15,27 @@ typedef unsigned int diskptr_t;
 #define BLOCK_SZ 512
 #define MAX_FILES 256
 
-#define NOT_IMPLEMENTED(x) fprintf(stderr, "got call to %s (not implemented)\n", x)
+#define NOT_IMPLEMENTED(x) printf("got call to %s (not implemented)\n", x)
+
+struct superblock {
+    char magic[4];
+    diskptr_t head;
+};
 
 struct inode {
     size_t size;
     size_t blocks;
     diskptr_t block[16];
+    time_t ctime;
+    time_t mtime;
 };
 
 #define MAX_OPEN_FILES 4
 typedef struct ctx {
-	int disk;
-	diskptr_t inode_map[MAX_FILES];	
-	struct inode cur_files[MAX_OPEN_FILES];
+    int disk;
+    struct superblock super;
+    diskptr_t inode_map[MAX_FILES]; 
+    struct inode cur_files[MAX_OPEN_FILES];
 } ctx_t;
 
 // Writes a `buf` of `len` bytes padded to the nearest number of blocks on disk.
@@ -34,42 +43,42 @@ void __write_blocks(int fd, const char* buf, size_t len) {
     for (size_t i = 0; i < (len/BLOCK_SZ); i++) {
         write(fd, buf+(i*BLOCK_SZ), BLOCK_SZ);
     }
-	if (len % BLOCK_SZ != 0) {
-		char end_buf[BLOCK_SZ] = {0};
-		memcpy(end_buf, buf+((len/BLOCK_SZ)*BLOCK_SZ), len % BLOCK_SZ);
-		write(fd, end_buf, BLOCK_SZ); 
-	}
+    if (len % BLOCK_SZ != 0) {
+        char end_buf[BLOCK_SZ] = {0};
+        memcpy(end_buf, buf+((len/BLOCK_SZ)*BLOCK_SZ), len % BLOCK_SZ);
+        write(fd, end_buf, BLOCK_SZ); 
+    }
 }
 
 void write_blocks (const char* buf, size_t len) {
-	ctx_t* ctx = fuse_get_context()->private_data;
-	__write_blocks(ctx->disk, buf, len);
+    ctx_t* ctx = fuse_get_context()->private_data;
+    __write_blocks(ctx->disk, buf, len);
 }
 
 // Reads `num` blocks at the current position in disk to user-specified `buf`
 void read_blocks(char* buf, size_t num) {
-	ctx_t* ctx = fuse_get_context()->private_data;
-	for (size_t i = 0; i < num; i++) {
-		read(ctx->disk, buf+(i*BLOCK_SZ), BLOCK_SZ);
-	}
+    ctx_t* ctx = fuse_get_context()->private_data;
+    for (size_t i = 0; i < num; i++) {
+        read(ctx->disk, buf+(i*BLOCK_SZ), BLOCK_SZ);
+    }
 }
 
 // Reads block at `loc` into user-specified `buf`. No side-effects, seeks back.
 void read_block(char* buf, size_t loc) {
-	ctx_t* ctx = fuse_get_context()->private_data;
-	off_t cur_loc = lseek(ctx->disk, 0, SEEK_CUR);
-	lseek(ctx->disk, loc*BLOCK_SZ, SEEK_SET);
-	read(ctx->disk, buf, BLOCK_SZ);
-	lseek(ctx->disk, cur_loc, SEEK_SET);
+    ctx_t* ctx = fuse_get_context()->private_data;
+    off_t cur_loc = lseek(ctx->disk, 0, SEEK_CUR);
+    lseek(ctx->disk, loc*BLOCK_SZ, SEEK_SET);
+    read(ctx->disk, buf, BLOCK_SZ);
+    lseek(ctx->disk, cur_loc, SEEK_SET);
 }
 
 diskptr_t current_block() {
-	ctx_t* ctx = fuse_get_context()->private_data;
+    ctx_t* ctx = fuse_get_context()->private_data;
     return lseek(ctx->disk, 0, SEEK_CUR)/BLOCK_SZ;
 }
 
 int get_fd() {
-	ctx_t* ctx = fuse_get_context()->private_data;
+    ctx_t* ctx = fuse_get_context()->private_data;
     char zero[sizeof(struct inode)] = {0}; // gross
     for (size_t i = 0; i < MAX_OPEN_FILES; i++) {
         if (memcmp(ctx->cur_files+i, zero, sizeof(struct inode)) == 0) return i;
@@ -77,6 +86,11 @@ int get_fd() {
     return -1;
 }
 
+#define MAX_FNAME_LEN 28
+struct dir_entry {
+    char name[MAX_FNAME_LEN];
+    size_t inode;
+};
 
 static int lfs_readlink(const char *path, char *buf, size_t size) { NOT_IMPLEMENTED("readlink()"); }
 static int lfs_mknod(const char *path, mode_t mode, dev_t rdev) { NOT_IMPLEMENTED("mknod()"); }
@@ -109,174 +123,162 @@ static int lfs_removexattr(const char *path, const char *name) { NOT_IMPLEMENTED
 
 #ifdef HAVE_COPY_FILE_RANGE
 static ssize_t lfs_copy_file_range(const char *path_in,
-				   struct fuse_file_info *fi_in,
-				   off_t offset_in, const char *path_out,
-				   struct fuse_file_info *fi_out,
-				   off_t offset_out, size_t len, int flags) { NOT_IMPLEMENTED("copy_file_range()"); }
+                                   struct fuse_file_info *fi_in,
+                                   off_t offset_in, const char *path_out,
+                                   struct fuse_file_info *fi_out,
+                                   off_t offset_out, size_t len, int flags) { NOT_IMPLEMENTED("copy_file_range()"); }
 #endif
 
-struct superblock {
-	char magic[4];
-	diskptr_t head;
-};
-
 static void* lfs_init(struct fuse_conn_info* conn) {
-	printf("initializing\n");
-	ctx_t* ctx = fuse_get_context()->private_data;
-	char buf[BLOCK_SZ*2];
-	read_blocks(buf, 2);
-	memcpy(ctx->inode_map, buf+BLOCK_SZ, BLOCK_SZ);   
-	return NULL;
+    printf("initializing\n");
+    ctx_t* ctx = fuse_get_context()->private_data;
+    char buf[BLOCK_SZ*3];
+    read_blocks(buf, 3);
+    ctx->super = *(struct superblock*)buf;
+    memcpy(ctx->inode_map, buf+BLOCK_SZ, BLOCK_SZ*2);
+    lseek(ctx->disk, ctx->super.head*BLOCK_SZ, SEEK_SET);
+    return ctx;
 }
 
 static int lfs_access(const char *path, int mask) {
-	return 0;
+    return 0;
 }
 
 static int lfs_getattr(const char *path, struct stat *stbuf) {
-	printf("getattr() on %s\n", path);
-	bzero(stbuf, sizeof(struct stat));
-	/* struct stat test; */
-	/* int ret = lstat(path, stbuf); */
-	lstat("/home/quantumish/projects/lfs/lfs_disk", stbuf);
-	/* printf("mode is %d, ret is %d\n", stbuf->st_mode, ret); */
-	/* stbuf->st_uid = test.st_uid; */
-	/* stbuf->st_gid = test.st_gid; */
-	if (strcmp(path, "/test") == 0) {
-		stbuf->st_mode = 010777;
-		return 0;
-	} else if (strcmp(path, "/") == 0) {
-		stbuf->st_mode = 040777;
-		return 0;
-	}	
-	return -1;
+    printf("getattr() on %s\n", path);
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = 040777;
+        return 0;
+    }
+    return -2;
 }
 
 
 static int lfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-	printf("whee\n");
-	fi->fh = get_fd();
-	return 0;
+    printf("create() %s\n", path);
+    ctx_t* ctx = fuse_get_context()->private_data;
+    fi->fh = get_fd();
+    time(&ctx->cur_files[fi->fh].ctime);
+    return 0;
 }
 
 static int lfs_open(const char* path, struct fuse_file_info* fi) {
-	fi->fh = get_fd();
-	return 0;
+    NOT_IMPLEMENTED("open()");
+    /* printf("open() %s\n", path); */
+    /* fi->fh = get_fd(); */
+    // return 0;
 }
 
-static int lfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {	
-	ctx_t* ctx = fuse_get_context()->private_data;
-	int fd = fi->fh;
-	write_blocks(buf, size);
-	struct inode inode = ctx->cur_files[fd];
-	size_t blocks_written = (size+(BLOCK_SZ-1))/BLOCK_SZ;    
+static int lfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) { 
+    ctx_t* ctx = fuse_get_context()->private_data;
+    int fd = fi->fh;
+    write_blocks(buf, size);
+    struct inode inode = ctx->cur_files[fd];
+    size_t blocks_written = (size+(BLOCK_SZ-1))/BLOCK_SZ;    
     inode.size = size;
     diskptr_t data_start = current_block()-blocks_written;
     for (size_t i = 0; i < inode.blocks; i++) {
         inode.block[i] = data_start+i;
     }
     inode.blocks = blocks_written;
-	write_blocks((char*)&inode, sizeof(inode));	
-	return size;
+    write_blocks((char*)&inode, sizeof(inode));     
+    return size;
 }
 
-#define MAX_FNAME_LEN 28
-struct dir_entry {
-	char name[MAX_FNAME_LEN];
-	size_t inode;
-};
-
 static int lfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
-	NOT_IMPLEMENTED("readdir()");
+    /* if (strcmp(path, "/") == 0) { // temp HACK */
+    /*      filler(buf,  */
+    /* } */
+    /* NOT_IMPLEMENTED("readdir()"); */
+    return 0;
 }
 
 static int lfs_mkdir(const char *path, mode_t mode) {
-	NOT_IMPLEMENTED("mkdir()");
+    NOT_IMPLEMENTED("mkdir()");
 } 
 
-
 static const struct fuse_operations lfs_oper = {
-	.init           = lfs_init,
-	.getattr	= lfs_getattr,
-	.access		= lfs_access,
-	.readlink	= lfs_readlink,
-	.readdir	= lfs_readdir,
-	.mknod		= lfs_mknod,
-	.mkdir		= lfs_mkdir,
-	.symlink	= lfs_symlink,
-	.unlink		= lfs_unlink,
-	.rmdir		= lfs_rmdir,
-	.rename		= lfs_rename,
-	.link		= lfs_link,
-	.chmod		= lfs_chmod,
-	.chown		= lfs_chown,
-	.truncate	= lfs_truncate,
+    .init           = lfs_init,
+    .getattr        = lfs_getattr,
+    .access         = lfs_access,
+    .readlink       = lfs_readlink,
+    .readdir        = lfs_readdir,
+    .mknod          = lfs_mknod,
+    .mkdir          = lfs_mkdir,
+    .symlink        = lfs_symlink,
+    .unlink         = lfs_unlink,
+    .rmdir          = lfs_rmdir,
+    .rename         = lfs_rename,
+    .link           = lfs_link,
+    .chmod          = lfs_chmod,
+    .chown          = lfs_chown,
+    .truncate       = lfs_truncate,
 #ifdef HAVE_UTIMENSAT
-	.utimens	= lfs_utimens,
+    .utimens        = lfs_utimens,
 #endif
-	.open		= lfs_open,
-	.create 	= lfs_create,
-	.read		= lfs_read,
-	.write		= lfs_write,
-	.statfs		= lfs_statfs,
-	.release	= lfs_release,
-	.fsync		= lfs_fsync,
+    .open           = lfs_open,
+    .create         = lfs_create,
+    .read           = lfs_read,
+    .write          = lfs_write,
+    .statfs         = lfs_statfs,
+    .release        = lfs_release,
+    .fsync          = lfs_fsync,
 #ifdef HAVE_POSIX_FALLOCATE
-	.fallocate	= lfs_fallocate,
+    .fallocate      = lfs_fallocate,
 #endif
 #ifdef HAVE_SETXATTR
-	.setxattr	= lfs_setxattr,
-	.getxattr	= lfs_getxattr,
-	.listxattr	= lfs_listxattr,
-	.removexattr	= lfs_removexattr,
+    .setxattr       = lfs_setxattr,
+    .getxattr       = lfs_getxattr,
+    .listxattr      = lfs_listxattr,
+    .removexattr    = lfs_removexattr,
 #endif
 #ifdef HAVE_COPY_FILE_RANGE
-	.copy_file_range = lfs_copy_file_range,
+    .copy_file_range = lfs_copy_file_range,
 #endif
-	/* .lseek		= lfs_lseek, */
+    /* .lseek               = lfs_lseek, */
 };
 
 int main(int argc, char** argv) {
-	if (argc < 3) {
-		fprintf(stderr, "lfs: usage is either 'lfs [disk] [mountpoint]' or 'lfs mkfs [disk]'\n");
-		return 1;
-	}
+    if (argc < 3) {
+        fprintf(stderr, "lfs: usage is either 'lfs [disk] [mountpoint]' or 'lfs mkfs [disk]'\n");
+        return 1;
+    }
 
-	ctx_t* ctx = calloc(sizeof(ctx_t), 1);
+    ctx_t* ctx = calloc(sizeof(ctx_t), 1);
 
-	/* init state         */
-	/* +---+------------+ */
-	/* | # | disk block | */
-	/* +---+------------+ */
-	/* | 0 | superblock | */
-	/* | 1 | inode map  | */
-	/* | 2 | inode map  | */
-	/* | 3 | / data     | */
-	/* | 4 | / inode    | */
-	/* +---+------------+ */	
-	
-	if (strcmp(argv[1], "mkfs") == 0) {
-		ctx->disk = open(argv[2], O_WRONLY | O_CREAT, 0644);
-		struct superblock super = { .magic = "LFS", .head = 5 };		
-		__write_blocks(ctx->disk, (char*)&super, sizeof(struct superblock));
-		
-		ctx->inode_map[0] = 4;
-		__write_blocks(ctx->disk, (char*)ctx->inode_map, sizeof(ctx->inode_map));
-		
-		lseek(ctx->disk, BLOCK_SZ, SEEK_CUR);
-		struct inode root = {.blocks = 1, .block = { 3 }};
-		__write_blocks(ctx->disk, (char*)&root, sizeof(struct inode));
+    /* init state         */
+    /* +---+------------+ */
+    /* | # | disk block | */
+    /* +---+------------+ */
+    /* | 0 | superblock | */
+    /* | 1 | inode map  | */
+    /* | 2 | inode map  | */
+    /* | 3 | / data     | */
+    /* | 4 | / inode    | */
+    /* +---+------------+ */        
+        
+    if (strcmp(argv[1], "mkfs") == 0) {
+        ctx->disk = open(argv[2], O_WRONLY | O_CREAT, 0644);
+        struct superblock super = { .magic = "LFS", .head = 5 };                
+        __write_blocks(ctx->disk, (char*)&super, sizeof(struct superblock));
+                
+        ctx->inode_map[0] = 4;
+        __write_blocks(ctx->disk, (char*)ctx->inode_map, sizeof(ctx->inode_map));
+                
+        lseek(ctx->disk, BLOCK_SZ, SEEK_CUR);
+        struct inode root = {.blocks = 1, .block = { 3 }};
+        __write_blocks(ctx->disk, (char*)&root, sizeof(struct inode));
 
-		char buf[BLOCK_SZ] = {0};
-		for (size_t i = 0; i < DEFAULT_DISK_SZ-5; i++) { // TODO 5 is not general
-		    write(ctx->disk, buf, BLOCK_SZ);
-		}
-		
-		close(ctx->disk);
-		return 0;
-	}
+        char buf[BLOCK_SZ] = {0};
+        for (size_t i = 0; i < DEFAULT_DISK_SZ-5; i++) { // TODO 5 is not general
+            write(ctx->disk, buf, BLOCK_SZ);
+        }
+                
+        close(ctx->disk);
+        return 0;
+    }
 
-	umask(0);
-	ctx->disk = open(argv[1], O_RDWR);	
-	return fuse_main(argc-1, argv+1, &lfs_oper, ctx);
+    umask(0);
+    ctx->disk = open(argv[1], O_RDWR);      
+    return fuse_main(argc-1, argv+1, &lfs_oper, ctx);
 }
