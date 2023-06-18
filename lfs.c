@@ -98,7 +98,7 @@ int get_fd() {
     return -1;
 }
 
-#define MAX_FNAME_LEN 28
+#define MAX_FNAME_LEN 24
 struct dir_entry {
     char name[MAX_FNAME_LEN];
     size_t inode;
@@ -119,7 +119,6 @@ static int lfs_utimens(const char *path, const struct timespec ts[2], struct fus
 #endif
 static int lfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) { NOT_IMPLEMENTED("read()"); }
 static int lfs_statfs(const char *path, struct statvfs *stbuf) { NOT_IMPLEMENTED("statfs()"); }
-static int lfs_release(const char *path, struct fuse_file_info *fi) { NOT_IMPLEMENTED("release()"); }
 static int lfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) { NOT_IMPLEMENTED("fsync()"); }
 #ifdef HAVE_POSIX_FALLOCATE
 static int lfs_fallocate(const char *path, int mode, off_t offset, off_t length, struct fuse_file_info *fi) { NOT_IMPLEMENTED("fallocate()"); }
@@ -142,7 +141,7 @@ static ssize_t lfs_copy_file_range(const char *path_in,
 #endif
 
 static void* lfs_init(struct fuse_conn_info* conn) {
-    printf("initializing\n");
+    // printf("initializing\n");
     ctx_t* ctx = fuse_get_context()->private_data;
     char buf[BLOCK_SZ*3];
     read_blocks(buf, 3);
@@ -167,17 +166,17 @@ int get_parent_inum(const char* path) {
 }
 
 const char* get_fname(const char* path) {
-	char* old = NULL;
+	char* old = (char*)path;
 	char* next = (char*)path+1;
     while ((next = strchr(next+1, '/'))) {
-        printf("%s %p\n", next, next);
+        // printf("%s %p\n", next, next);
 		old = next;
     }    
     return old+1;
 }
 
 static int lfs_getattr(const char *path, struct stat *stbuf) {
-    printf("getattr() on %s\n", path);
+    // printf("getattr() on %s\n", path);
     if (strcmp(path, "/") == 0) {
         stbuf->st_mode = 040777;
         return 0;
@@ -190,13 +189,16 @@ static int lfs_getattr(const char *path, struct stat *stbuf) {
         
     const char* fname = get_fname(path);
     for (size_t i = 0; i < dir_inode.blocks; i++) {
+        // printf("%d\n", dir_inode.block[i]);
         struct dir_entry entries[16] = {0}; // HACK not general
-        read_block((char*)entries, dir_inode.block[i], BLOCK_SZ);
+        read_block((char*)entries, dir_inode.block[i], BLOCK_SZ);        
         for (size_t i = 0; i < 16; i++) {
             if (strcmp(fname, entries[i].name) == 0) {
                 struct inode inode;
                 read_block((char*)&inode, ctx->inode_map[entries[i].inode], sizeof(struct inode));
-                return inode.mode;
+                // printf("here! (%s) %d\n", path, inode.mode);
+                stbuf->st_mode = inode.mode;
+                return 0;
             }
         }
     }
@@ -204,7 +206,7 @@ static int lfs_getattr(const char *path, struct stat *stbuf) {
     return -2;
 }
 static int lfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-    printf("create() %s\n", path);
+    // printf("create() %s\n", path);
     ctx_t* ctx = fuse_get_context()->private_data;
 
     // setup inode
@@ -245,13 +247,21 @@ static int lfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
 
     // write last + inode
     write_blocks((char*)entries, BLOCK_SZ);
+    ctx->inode_map[parent] = current_block();
     write_blocks((char*)&dir_inode, sizeof(struct inode));    
+    return 0;
+}
+
+static int lfs_release(const char *path, struct fuse_file_info *fi) {
+    // printf("release() %s\n", path);
+    ctx_t* ctx = fuse_get_context()->private_data;
+    bzero(ctx->cur_files+(fi->fh), sizeof(struct inode));
     return 0;
 }
 
 static int lfs_open(const char* path, struct fuse_file_info* fi) {
     NOT_IMPLEMENTED("open()");
-    /* printf("open() %s\n", path); */
+    /* // printf("open() %s\n", path); */
     /* fi->fh = get_fd(); */
     // return 0;
 }
